@@ -220,6 +220,70 @@ public String sendSmsFallback(String ip) {
 
 ---
 
+## 5.3 编程式使用（Service/工具类/动态规则）
+
+本组件不只支持 Controller/RPC 层的注解拦截，也支持在 Service 内部直接注入 `GuardStore` 做编程式调用，适合：
+
+- 同一个方法内按业务分支做不同保护策略
+- 动态规则：不同用户等级不同限流阈值
+- 非 AOP 场景：工具类、非代理调用链中也能使用
+
+### 1) 注入 GuardStore 做幂等
+
+```java
+@Service
+public class OrderService {
+
+  @Autowired
+  private GuardStore guardStore;
+
+  public void processOrder(OrderReq req) {
+    String key = "order:" + req.getOrderNo();
+    if (!guardStore.acquireIdempotent(key, 10, TimeUnit.SECONDS)) {
+      throw new RuntimeException("订单已处理，请勿重复提交");
+    }
+
+    try {
+      // 核心业务逻辑
+    } finally {
+      // 需要允许业务异常重试时，才考虑释放（按你的业务策略）
+      // guardStore.releaseIdempotent(key);
+    }
+  }
+}
+```
+
+### 2) 手动限流
+
+```java
+public void sendSms(String phone) {
+  String rateKey = "sms:" + phone;
+  if (!guardStore.acquireRate(rateKey, 5, 60, TimeUnit.SECONDS)) {
+    throw new RuntimeException("短信发送太频繁，请稍后再试");
+  }
+}
+```
+
+### 3) 动态限流（按用户等级）
+
+```java
+long limit = user.isVip() ? 100 : 10;
+boolean allowed = guardStore.acquireRate("api:call:" + userId, limit, 1, TimeUnit.MINUTES);
+if (!allowed) {
+  throw new RuntimeException("请求过于频繁");
+}
+```
+
+### 4) Key 规范建议（避免冲突）
+
+编程式调用时，`GuardStore` 不会自动帮你拼 `appName/前缀`（它只接收你传入的 key）。建议你在团队里统一规范，例如：
+
+```
+{appName}:{idem/rl}:{bizKey}
+```
+
+并尽量与注解默认前缀 `idem:` / `rl:` 保持一致，避免“同一业务两套 key 体系”。
+
 ## 6. Key 生成与 SpEL 使用说明
 
 ### 6.1 Key 的最终格式
@@ -249,8 +313,7 @@ demo-app:idem:order:A001
 
 默认可用变量（推荐直接使用，不需要 `#`）：
 
-- `header`：`Map<String,String>`，所有请求头（key 已转小写）
-- `header`：`Map<String,String>`，所有请求头（读取时忽略大小写，`header['Authorization']` 与 `header['authorization']` 等价）
+- `header`：`Map<String,String>`，所有请求头（读取忽略大小写，`header['Authorization']` 与 `header['authorization']` 等价）
 - `param`：`Map<String,String>`，所有 Query 参数（取第一个值）
 - `ip`：`String`，客户端 IP（remoteAddr）
 - `token`：`String`，从 `Authorization` 头自动提取的纯 token（自动去掉 `Bearer ` 前缀）

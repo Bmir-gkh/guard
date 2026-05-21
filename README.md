@@ -220,6 +220,51 @@ public String sendSmsFallback(String ip) {
 
 ---
 
+## 5.3 编程式使用（Service/工具类/动态规则）
+
+除了注解式拦截，你也可以在 Service 内直接注入 `GuardStore` 进行编程式调用，适用于复杂业务分支、动态规则、以及非 AOP 场景。
+
+### 1) 手动幂等
+
+```java
+@Service
+public class OrderService {
+
+  @Autowired
+  private GuardStore guardStore;
+
+  public void processOrder(OrderReq req) {
+    String key = "order:" + req.getOrderNo();
+    if (!guardStore.acquireIdempotent(key, 10, TimeUnit.SECONDS)) {
+      throw new RuntimeException("订单已处理，请勿重复提交");
+    }
+    try {
+      // 核心业务逻辑
+    } finally {
+      // guardStore.releaseIdempotent(key);
+    }
+  }
+}
+```
+
+### 2) 手动限流 + 动态阈值
+
+```java
+long limit = user.isVip() ? 100 : 10;
+boolean allowed = guardStore.acquireRate("api:call:" + userId, limit, 1, TimeUnit.MINUTES);
+if (!allowed) {
+  throw new RuntimeException("请求过于频繁");
+}
+```
+
+### 3) Key 规范建议
+
+编程式调用时 `GuardStore` 不会自动补齐 `appName/前缀`，建议统一规范（并与注解保持一致）：
+
+```
+{appName}:{idem/rl}:{bizKey}
+```
+
 ## 6. Key 生成与 SpEL 使用说明
 
 ### 6.1 Key 的最终格式
@@ -249,7 +294,6 @@ demo-app:idem:order:A001
 
 默认可用变量（推荐直接使用，不需要 `#`）：
 
-- `header`：`Map<String,String>`，所有请求头（key 已转小写）
 - `header`：`Map<String,String>`，所有请求头（读取时忽略大小写，`header['Authorization']` 与 `header['authorization']` 等价）
 - `param`：`Map<String,String>`，所有 Query 参数（取第一个值）
 - `ip`：`String`，客户端 IP（remoteAddr）
