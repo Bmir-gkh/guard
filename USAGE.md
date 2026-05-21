@@ -40,6 +40,39 @@
 
 ## 3. 推荐接入方式（只引入一个 Starter）
 
+### 3.0 从源码安装到本地 Maven 仓库（离线/私有项目常用）
+
+如果你是“下载源码后直接用”，或者你们公司网络环境无法直接拉取 GitHub Packages/私服，可以先把本项目安装到你本机的 `~/.m2/repository`，再在业务项目里按普通 Maven 依赖引入。
+
+步骤：
+
+1) 在本项目根目录执行：
+
+```bash
+mvn clean install -DskipTests
+```
+
+2) 安装成功后，本地仓库会出现例如：
+
+- `~/.m2/repository/com/yourcompany/common-guard-spring-boot-starter/1.0.0-SNAPSHOT/`
+- `~/.m2/repository/com/yourcompany/common-guard-autoconfigure/1.0.0-SNAPSHOT/`
+- ...
+
+3) 然后在你的业务项目 `pom.xml` 中正常引入（示例）：
+
+```xml
+<dependency>
+  <groupId>com.yourcompany</groupId>
+  <artifactId>common-guard-spring-boot-starter</artifactId>
+  <version>1.0.0-SNAPSHOT</version>
+</dependency>
+```
+
+注意：
+
+- `SNAPSHOT` 版本会被 Maven 当作快照版本处理，如果你希望固定版本，建议把本项目版本改为例如 `1.0.0` 再 `mvn clean install`
+- 如果你们有公司私服（Nexus/Artifactory），建议使用 `mvn deploy` 发布到私服，团队共享更方便
+
 ### 3.1 Maven 依赖
 
 业务项目只需要引入：

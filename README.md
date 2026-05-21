@@ -1,4 +1,4 @@
-# common-guard 使用说明（详细版）
+# common-guard 使用说明
 
 本文档基于当前工程代码整理，面向“直接接入业务项目”的使用与运维说明（Java 17 / Spring Boot 3.x）。
 
@@ -130,7 +130,7 @@ common:
 - `key`：SpEL 表达式（必填），用来生成幂等 Key
 - `expire`/`timeUnit`：幂等 key 的 TTL
 - `message`：重复请求时的默认提示
-- `bizNo`：业务单号（可选 SpEL），便于记录与返回
+- `bizNo`：业务单号（可选 SpEL），便于日志、告警与排障定位（不参与幂等判定逻辑，默认空）
 - `handler`：自定义重复请求处理器（返回你想抛出的异常）
 - `onException`：业务异常时是否删除 key（允许重试）
 
@@ -152,9 +152,14 @@ public String create(@RequestBody OrderReq req) {
 
 - `key`：SpEL 表达式（必填），用来生成限流 key
 - `limit`：窗口内允许次数
-- `window`/`timeUnit`：窗口大小
+- `window`/`timeUnit`：窗口大小，用来定义“统计周期”。含义：在 `window * timeUnit` 这段时间内，同一个 key 最多允许 `limit` 次
 - `algorithm`：`FIXED_WINDOW`（固定窗口）/ `TOKEN_BUCKET`（令牌桶）
 - `fallback`：被限流时调用的降级方法名（必须与原方法入参一致）
+
+`window` 在不同算法下的含义：
+
+- **FIXED_WINDOW（固定窗口）**：`window` 决定窗口切片大小（例如 60 秒一个窗口）。同一窗口内计数累加，窗口到期换新窗口。
+- **TOKEN_BUCKET（令牌桶）**：当前实现里 `window` 作为“补充周期/刷新周期”（例如 60 秒补满一次令牌）；`limit` 作为桶容量（每周期最多放行 `limit` 次，体验更平滑）。
 
 示例（固定窗口）：
 
@@ -211,7 +216,8 @@ demo-app:idem:order:A001
 
 默认可用变量（推荐直接使用，不需要 `#`）：
 
-- `header`：`Map<String,String>`，所有请求头（读取忽略大小写，`header['Authorization']` 与 `header['authorization']` 等价）
+- `header`：`Map<String,String>`，所有请求头（key 已转小写）
+- `header`：`Map<String,String>`，所有请求头（读取时忽略大小写，`header['Authorization']` 与 `header['authorization']` 等价）
 - `param`：`Map<String,String>`，所有 Query 参数（取第一个值）
 - `ip`：`String`，客户端 IP（remoteAddr）
 - `token`：`String`，从 `Authorization` 头自动提取的纯 token（自动去掉 `Bearer ` 前缀）
@@ -248,6 +254,135 @@ Key 解析明确禁用：
 仅允许“读取变量/属性”以满足拼 key 场景。
 
 ---
+
+## 6.6 场景示例合集（覆盖常见用法）
+
+下面示例默认你已引入 `common-guard-spring-boot-starter`，且 `store` 配置已正确。
+
+### 示例 1：提交类接口幂等（基于 token）
+
+适用：用户配置提交、支付提交、表单提交。
+
+```java
+@Idempotent(key = "'cfg:' + token", expire = 3, timeUnit = TimeUnit.SECONDS, message = "请勿重复提交")
+@PostMapping("/config")
+public String saveConfig() {
+  return "OK";
+}
+```
+
+### 示例 2：幂等（基于 header + body 业务号）
+
+适用：订单、支付、资金相关写接口，推荐 key = 用户唯一标识 + 业务单号。
+
+```java
+public record OrderReq(String orderNo) {}
+
+@Idempotent(key = "'order:' + header['x-user-id'] + ':' + #req.orderNo", bizNo = "#req.orderNo", expire = 30)
+@PostMapping("/order")
+public String create(@RequestBody OrderReq req) {
+  return "OK";
+}
+```
+
+### 示例 3：幂等（业务异常是否释放 key）
+
+适用：你希望业务异常后允许立即重试（DELETE_KEY），或希望仍然保持幂等保护（KEEP_KEY）。
+
+```java
+@Idempotent(key = "'pay:' + #req.payNo", onException = OnException.KEEP_KEY)
+@PostMapping("/pay")
+public String pay(@RequestBody PayReq req) {
+  return "OK";
+}
+```
+
+### 示例 4：自定义重复请求处理（返回自定义异常）
+
+```java
+public class BizIdemHandler implements IdempotentExceptionHandler {
+  @Override
+  public RuntimeException handle(IdempotentViolation v) {
+    return new RuntimeException("重复提交：" + v.getBizNo());
+  }
+}
+
+@Idempotent(key = "'x:' + token", handler = BizIdemHandler.class, message = "请勿重复提交")
+@PostMapping("/demo")
+public String demo() {
+  return "OK";
+}
+```
+
+### 示例 5：限流（固定窗口，按 IP）
+
+适用：短信、验证码、敏感查询等。
+
+```java
+@RateLimit(key = "'sms:' + ip", limit = 5, window = 60, message = "请求过于频繁")
+@GetMapping("/send-sms")
+public String sendSms() {
+  return "OK";
+}
+```
+
+### 示例 6：限流（固定窗口，按 IP + Query 参数）
+
+适用：同 IP 对同账号高频操作。
+
+```java
+@RateLimit(key = "'login:' + ip + ':' + param['username']", limit = 5, window = 60)
+@PostMapping("/login")
+public String login() {
+  return "OK";
+}
+```
+
+### 示例 7：限流（令牌桶，平滑突发）
+
+适用：需要“平滑”限制，而不是严格固定窗口。
+
+```java
+@RateLimit(key = "'api:' + token", limit = 10, window = 60, algorithm = LimitAlgorithm.TOKEN_BUCKET)
+@GetMapping("/profile")
+public String profile() {
+  return "OK";
+}
+```
+
+### 示例 8：限流被拒绝时 fallback 降级
+
+```java
+@RateLimit(key = "'query:' + ip", limit = 3, window = 10, fallback = "queryFallback")
+@GetMapping("/query")
+public String query() {
+  return "OK";
+}
+
+public String queryFallback() {
+  return "TOO_MANY_REQUESTS";
+}
+```
+
+### 示例 9：定时任务/后台任务（非 Web 场景）
+
+适用：定时任务防止多实例重复执行；此时没有 request 变量，建议使用 `#p0/#args[0]`。
+
+```java
+@Idempotent(key = "'job:' + #p0", expire = 60, timeUnit = TimeUnit.SECONDS)
+public void runOnce(String jobId) {
+}
+```
+
+### 示例 10：MQ 消费幂等（方法参数即业务唯一号）
+
+适用：消息消费同一条消息重复投递，需要幂等保护。
+
+```java
+@Idempotent(key = "'mq:' + #p0", expire = 300, timeUnit = TimeUnit.SECONDS)
+public void onMessage(String messageId) {
+}
+```
 
 ## 7. 存储模式与行为差异
 
@@ -427,3 +562,96 @@ java.lang.IllegalStateException: GuardStore 未找到
 - 对外接口（尤其写接口）建议幂等；对短信/验证码/登录等建议限流
 - 集群部署优先选择 Redisson（Caffeine 适合单机或边缘降级）
 - 对 Redis 故障敏感的业务优先 `fail-on-error=false`，配合监控告警
+
+---
+
+## 12. 非 Spring Boot 项目如何使用
+
+### 12.1 Spring（非 Boot）项目
+
+如果你的项目使用的是 Spring Framework（有 IoC 容器），但不使用 Spring Boot 的自动装配能力，仍然可以接入本组件：核心是“自己注册 Bean”。
+
+依赖建议（Maven）：
+
+```xml
+<dependency>
+  <groupId>com.yourcompany</groupId>
+  <artifactId>common-guard-core</artifactId>
+  <version>1.0.0-SNAPSHOT</version>
+</dependency>
+<dependency>
+  <groupId>com.yourcompany</groupId>
+  <artifactId>common-guard-store-caffeine</artifactId>
+  <version>1.0.0-SNAPSHOT</version>
+</dependency>
+<dependency>
+  <groupId>com.github.ben-manes.caffeine</groupId>
+  <artifactId>caffeine</artifactId>
+</dependency>
+```
+
+手动注册 Bean（示例以 Caffeine 为例）：
+
+```java
+@Configuration
+@EnableAspectJAutoProxy
+public class GuardManualConfig {
+
+  @Bean
+  public GuardStore guardStore() {
+    return new CaffeineGuardStore(10000, 600);
+  }
+
+  @Bean
+  public GuardKeyResolver guardKeyResolver() {
+    SpelKeyResolverOptions opt = new SpelKeyResolverOptions(
+        "application",
+        256,
+        512,
+        1000
+    );
+    return new SpelKeyResolver(opt);
+  }
+
+  @Bean
+  public GuardMetrics guardMetrics() {
+    return NoopGuardMetrics.INSTANCE;
+  }
+
+  @Bean
+  public IdempotentAspect idempotentAspect(GuardStore store, GuardKeyResolver resolver, GuardMetrics metrics, BeanFactory beanFactory) {
+    IdempotentAspectConfig cfg = new IdempotentAspectConfig("idem:", false, false, false, 256);
+    return new IdempotentAspect(store, resolver, metrics, cfg, beanFactory);
+  }
+
+  @Bean
+  public RateLimitAspect rateLimitAspect(GuardStore store, GuardKeyResolver resolver, GuardMetrics metrics) {
+    RateLimitAspectConfig cfg = new RateLimitAspectConfig("rl:", false, false, false, 256);
+    return new RateLimitAspect(store, resolver, metrics, cfg);
+  }
+}
+```
+
+说明：
+
+- 不使用 Spring Boot 时，`common.guard.*` 配置绑定不会生效，需要你在创建 Config 时传入对应参数
+- 仍然可以使用 `@Idempotent` / `@RateLimit` 注解（因为切面已手动注册）
+
+### 12.2 非 Spring（无 IoC / 无 AOP）项目
+
+如果项目不使用 Spring，那么注解与 AOP 拦截无法工作。此时建议直接使用存储层 API 自行控制幂等/限流：
+
+- 接口定义：[GuardStore](file:///Users/bmir/自我项目/guard/common-guard-store-api/src/main/java/com/yourcompany/guard/store/api/GuardStore.java)
+- 本地实现：[CaffeineGuardStore](file:///Users/bmir/自我项目/guard/common-guard-store-caffeine/src/main/java/com/yourcompany/guard/store/caffeine/CaffeineGuardStore.java)
+- Redisson 实现：[RedissonGuardStore](file:///Users/bmir/自我项目/guard/common-guard-store-redisson/src/main/java/com/yourcompany/guard/store/redisson/RedissonGuardStore.java)
+
+示例（伪代码）：
+
+```java
+GuardStore store = new CaffeineGuardStore(10000, 600);
+String key = "app:idem:order:A001";
+boolean first = store.acquireIdempotent(key, 10, TimeUnit.SECONDS);
+if (!first) {
+  throw new RuntimeException("重复请求");
+}
+```
